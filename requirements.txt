@@ -3,4 +3,3 @@ tensorflow-cpu==2.15.0
 keras==2.15.0
 pandas==2.2.2
 numpy==1.26.4
-protobuf<5
