@@ -1,0 +1,7 @@
+{
+  "final_val_accuracy": 1.0,
+  "final_val_loss": 0.0,
+  "epochs": 4,
+  "vocab_size": 2976,
+  "max_len": 96
+}
