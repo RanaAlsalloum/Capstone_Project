@@ -1,10 +1,10 @@
 # app.py — Bilingual (Arabic + English) Sentiment Analysis
 # --------------------------------------------------------
 # يدعم: نص واحد، CSV، PDF، DOCX + فحص البيئة
-# مضاف: تطبيع عربي + قواعد لفك الحياد (نفي/تعجب/مكثّفات/إيموجي)
-# يعمل بهيكل مجلدات: ./ar و ./en (أو ./bilingual_sentiment_model/ar & en)
+# مضاف: قواعد عربية لفك الحياد (نفي/تعجب/مكثّفات/إيموجي)
+# مضاف: مُحمّل نماذج ذكي يدعم Keras/SavedModel ويضمن وجود .predict()
 
-import os, sys, re, io, json
+import os, sys, re, json
 from pathlib import Path
 from typing import Dict, Any, Tuple, List
 
@@ -30,13 +30,12 @@ tokenizer_from_json = None
 pad_sequences = None
 
 def ensure_tf():
-    """Import TensorFlow + keras utils only when needed."""
+    """Import TensorFlow only when needed."""
     global tf, tokenizer_from_json, pad_sequences, TF_IMPORT_ERROR
     if tf is not None:
         return True, None
     try:
         import tensorflow as _tf
-        # Keras 3: tokenizer_from_json من keras.preprocessing.text
         from tensorflow.keras.preprocessing.text import tokenizer_from_json as _tok_json
         from tensorflow.keras.preprocessing.sequence import pad_sequences as _pad
         tf = _tf
@@ -51,8 +50,7 @@ def ensure_tf():
 # Config
 # ------------------------
 st.set_page_config(page_title="💬 Sentiment | تحليل المشاعر", page_icon="💬", layout="wide")
-st.caption("By: Rana Alsalloum, Yaqeen Adnan, Reem Al-Rshedi")
-
+DEFAULT_MODEL_DIR = Path("bilingual_sentiment_model")
 MAX_LEN = 96
 CLASSES_FALLBACK = ["negative", "neutral", "positive"]
 
@@ -75,7 +73,7 @@ def ar_normalize(s: str) -> str:
     return s
 
 def preprocess_text(txt: str, lang: str) -> str:
-    return ar_normalize(txt) if lang == "ar" else str(txt)
+    return ar_normalize(txt) if lang == "ar" else txt
 
 # ------------------------
 # Arabic rules/keywords to break neutrality
@@ -165,34 +163,59 @@ def override_ar_prediction(
     return label, top_p
 
 # ------------------------
-# Model discovery / loading
+# Model loader that supports Keras *and* SavedModel
 # ------------------------
-def resolve_model_root(user_text: str | None = None) -> Path:
-    """
-    يحدد أين المجلدين ar و en.
-    الترتيب:
-      1) قيمة المستخدم إن وجدت
-      2) مجلد العمل الحالي (./ar, ./en)
-      3) ./bilingual_sentiment_model
-    """
-    candidates = []
-    if user_text:
-        candidates.append(Path(user_text))
-    candidates.append(Path("."))
-    candidates.append(Path("bilingual_sentiment_model"))
-    for base in candidates:
-        if (base / "ar").exists() and (base / "en").exists():
-            return base
-    # لو ما وجد، نرجع الحالي — وسيظهر خطأ أوضح لاحقًا
-    return Path(user_text or ".")
+def _load_any_model(model_path: Path):
+    """يحاول تحميل Keras model؛ وإن كان SavedModel بلا predict يلفّه بواجهة .predict()."""
+    ok, _ = ensure_tf()
+    import tensorflow as _tf
 
+    # 1) جرّبي Keras مباشرة
+    try:
+        m = _tf.keras.models.load_model(model_path)
+        if hasattr(m, "predict"):
+            return m
+    except Exception:
+        pass
+
+    # 2) Fallback: tf.saved_model.load + تغليف predict
+    loaded = _tf.saved_model.load(str(model_path))
+    fn = (loaded.signatures.get("serve") or
+          loaded.signatures.get("serving_default"))
+    if fn is None:
+        if hasattr(loaded, "signatures") and len(loaded.signatures) > 0:
+            fn = list(loaded.signatures.values())[0]
+        else:
+            raise RuntimeError(f"Could not find a serving signature in {model_path}")
+
+    out_keys = list(fn.structured_outputs.keys())
+
+    def _predict_nd(x: np.ndarray):
+        in_name = list(fn.structured_input_signature[1].keys())[0]
+        x_tf = _tf.convert_to_tensor(x)
+        if x_tf.dtype not in (_tf.int32, _tf.float32):
+            x_tf = _tf.cast(x_tf, _tf.int32)  # أغلب موديلاتنا تتوقع int32
+        res = fn(**{in_name: x_tf})
+        y = res[out_keys[0]].numpy()
+        return y
+
+    class _Wrapper:
+        def predict(self, x, verbose: int = 0):
+            x = np.asarray(x)
+            return _predict_nd(x)
+
+    return _Wrapper()
+
+# ------------------------
+# Loaders
+# ------------------------
 @st.cache_resource(show_spinner=False)
-def load_lang_assets(base_dir: Path, lang: str):
+def load_lang_assets(model_root: Path, lang: str):
     ok, err = ensure_tf()
     if not ok:
         raise RuntimeError(f"TensorFlow import failed: {err}")
 
-    lang_dir = Path(base_dir) / lang
+    lang_dir = Path(model_root) / lang
     if not lang_dir.exists():
         raise FileNotFoundError(f"Language folder not found: {lang_dir}")
 
@@ -214,22 +237,22 @@ def load_lang_assets(base_dir: Path, lang: str):
     else:
         classes = CLASSES_FALLBACK
 
-    # model file (نفضل SavedModel إن وجد)
+    # model file (يدعم .keras أو saved_model/)
     candidates = [
-        lang_dir / "saved_model",
         lang_dir / f"{lang}_best.keras",
         lang_dir / f"{lang}_final.keras",
         lang_dir / f"{lang}_best.h5",
         lang_dir / f"{lang}_final.h5",
+        lang_dir / "saved_model",
     ]
     model_path = next((p for p in candidates if p.exists()), None)
     if model_path is None:
         raise FileNotFoundError(f"No model file found in {lang_dir}")
 
-    model = tf.keras.models.load_model(model_path)
+    model = _load_any_model(model_path)
     return tok, classes, model
 
-def _predict_batch(texts: List[str], base_dir: Path) -> pd.DataFrame:
+def _predict_batch(texts: List[str], model_root: Path) -> pd.DataFrame:
     ok, err = ensure_tf()
     if not ok:
         raise RuntimeError(f"TensorFlow import failed: {err}")
@@ -243,7 +266,7 @@ def _predict_batch(texts: List[str], base_dir: Path) -> pd.DataFrame:
         if not idxs:
             continue
         if lang not in cache:
-            tok, classes, model = load_lang_assets(base_dir, lang)
+            tok, classes, model = load_lang_assets(model_root, lang)
             cache[lang] = (tok, classes, model)
         else:
             tok, classes, model = cache[lang]
@@ -268,17 +291,12 @@ def _predict_batch(texts: List[str], base_dir: Path) -> pd.DataFrame:
                 "label": label,
                 "confidence": float(conf),
             }
-            # احتمالات مسماة (إن توفرت)
             for ci, cname in enumerate(classes):
-                row[f"p_{cname}"] = float(probs[j, ci])
+                # تجنّب خارج الفهرس إذا كان saved_model يعيد نفس الترتيب
+                if ci < probs.shape[1]:
+                    row[f"p_{cname}"] = float(probs[j, ci])
             rows.append(row)
-
-    # أعيدي ترتيب النتائج بنفس ترتيب الإدخال
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out["__ord"] = range(len(out))
-        out = out.sort_values("__ord").drop(columns="__ord")
-    return out
+    return pd.DataFrame(rows)
 
 # ------------------------
 # Readers
@@ -317,18 +335,15 @@ def read_csv(file) -> pd.DataFrame:
 # ------------------------
 with st.sidebar:
     st.header("⚙️ Settings | الإعدادات")
-    user_path = st.text_input(
-        "Model base folder | مسار مجلد الموديلات",
-        value=".",  # نتوقع ./ar و ./en بجانب app.py
-        help="ضع المسار الذي يحتوي مجلدَي ar و en. اتركيه '.' إذا كانا بجانب app.py مباشرة."
-    )
-    base_dir = resolve_model_root(user_path)
-    st.caption(f"Using base: `{base_dir.resolve()}` → يتوقع: `{base_dir}/ar` و `{base_dir}/en`")
+    model_root = Path(st.text_input("Model directory | مسار الموديلات", value=str(DEFAULT_MODEL_DIR)))
+    st.caption("bilingual_sentiment_model/ar & /en each: model + tokenizer.json + label_map.json (+ saved_model/ أو .keras).")
 
 # ------------------------
-# Tabs
+# Title
 # ------------------------
 st.title("💬 Sentiment Analysis | تحليل المشاعر (AR/EN)")
+st.caption("By: Rana Alsalloum, Yaqeen Adnan, Reem Al-Rshedi")
+
 tabs = st.tabs([
     "📝 Single Text | نص واحد",
     "📎 File (CSV / PDF / DOCX) | ملف",
@@ -348,21 +363,18 @@ with tabs[0]:
         if st.button("Predict"):
             if t.strip():
                 try:
-                    df = _predict_batch([t], base_dir)
-                    if df.empty:
-                        st.error("لم أستطع توليد تنبؤ. تأكدي من وجود المجلدين ar و en بشكل صحيح.")
-                    else:
-                        row = df.iloc[0]
-                        lang_badge = "🇸🇦 عربي" if row["lang"] == "ar" else "🇬🇧 English"
-                        st.success(f"**Language:** {lang_badge}\n\n**Prediction:** `{row['label']}`  |  **Confidence:** `{row['confidence']:.3f}`")
-                        prob_cols = [c for c in df.columns if c.startswith("p_")]
-                        if prob_cols:
-                            st.markdown("**Probabilities:**")
-                            st.dataframe(df[prob_cols].T.rename(columns={0: "probability"}))
+                    df = _predict_batch([t], model_root)
+                    row = df.iloc[0]
+                    lang_badge = "🇸🇦 عربي" if row["lang"] == "ar" else "🇬🇧 English"
+                    st.success(f"**Language:** {lang_badge}\n\n**Prediction:** `{row['label']}`  |  **Confidence:** `{row['confidence']:.3f}`")
+                    prob_cols = [c for c in df.columns if c.startswith("p_")]
+                    if prob_cols:
+                        st.markdown("**Probabilities:**")
+                        st.dataframe(df[prob_cols].T.rename(columns={0: "probability"}))
                 except Exception as e:
                     st.error(str(e))
             else:
-                st.warning("اكتبي نصًا أولاً.")
+                st.warning("اكتب نصًا أولاً.")
 
 # ------------------------
 # Tab 2 - File upload
@@ -385,7 +397,7 @@ with tabs[1]:
                 else:
                     texts = read_docx(up)
 
-                out_df = _predict_batch(texts, base_dir)
+                out_df = _predict_batch(texts, model_root)
                 st.dataframe(out_df, use_container_width=True)
                 st.download_button("Download CSV", data=out_df.to_csv(index=False).encode("utf-8"),
                                    file_name="predictions.csv", mime="text/csv")
@@ -401,21 +413,15 @@ with tabs[2]:
     st.write("**TensorFlow imported?**", ok_tf)
     if ok_tf:
         st.write("TF version:", tf.__version__)
-        try:
-            st.write("Num GPUs:", len(tf.config.list_physical_devices('GPU')))
-        except Exception:
-            pass
+        st.write("Num GPUs:", len(tf.config.list_physical_devices('GPU')))
     else:
         st.error(err_tf)
-
-    st.write("**Looking for model folders:**")
-    for name in ("ar", "en"):
-        d = base_dir / name
-        st.write(f"- `{d}` exists? →", d.exists())
+    st.write("**Model root exists?**", DEFAULT_MODEL_DIR.exists(), str(DEFAULT_MODEL_DIR.resolve()))
+    for lang in ("ar","en"):
+        d = DEFAULT_MODEL_DIR / lang
+        st.write(f"**{lang} folder exists?**", d.exists(), str(d))
         if d.exists():
             try:
                 st.code("\n".join([p.name for p in sorted(d.iterdir())]), language="bash")
-            except Exception:
+            except:
                 pass
-
-    st.info("التوقع يحتاج: لكل لغة `saved_model/` + `tokenizer.json` + `label_map.json`.")
