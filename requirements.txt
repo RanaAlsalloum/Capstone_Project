@@ -1,8 +1,9 @@
 streamlit==1.32.2
-numpy==1.24.4
+numpy==1.23.5
 pandas==2.0.3
 
 tensorflow-cpu==2.12.0
+typing_extensions==4.5.0
 protobuf<4.0.0
 
 pypdf==4.2.0
