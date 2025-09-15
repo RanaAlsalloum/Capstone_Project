@@ -1,8 +1,7 @@
 # app.py — Bilingual (Arabic + English) Sentiment Analysis
 # --------------------------------------------------------
 # يدعم: نص واحد، CSV، PDF، DOCX + فحص البيئة
-# مضاف: قواعد عربية لفك الحياد (نفي/تعجب/مكثّفات/إيموجي)
-# مضاف: مُحمّل نماذج ذكي يدعم Keras/SavedModel ويضمن وجود .predict()
+# مضاف: قواعد عربية لفك الحياد + تنزيل النماذج من Google Drive تلقائياً
 
 import os, sys, re, json
 from pathlib import Path
@@ -50,9 +49,61 @@ def ensure_tf():
 # Config
 # ------------------------
 st.set_page_config(page_title="💬 Sentiment | تحليل المشاعر", page_icon="💬", layout="wide")
+
+# 👇 عدّل هذا الرابط لو تغيّر
+GOOGLE_DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1Aw-A95Ep-6ByshJoveXgCLi1yOCk2o45?usp=share_link"
+
 DEFAULT_MODEL_DIR = Path("bilingual_sentiment_model")
 MAX_LEN = 96
 CLASSES_FALLBACK = ["negative", "neutral", "positive"]
+
+# ------------------------
+# Helpers: Google Drive fetch
+# ------------------------
+def _lang_ready(lang_dir: Path) -> bool:
+    """يتأكد أن ملفات اللغة مكتملة."""
+    if not lang_dir.exists():
+        return False
+    tok_ok = (lang_dir / "tokenizer.json").exists()
+    lbl_ok = (lang_dir / "label_map.json").exists()
+    keras_ok = any((lang_dir / f).exists() for f in [f"{lang_dir.name}_best.keras", f"{lang_dir.name}_final.keras",
+                                                     f"{lang_dir.name}_best.h5", f"{lang_dir.name}_final.h5"])
+    saved_ok = (lang_dir / "saved_model").exists()
+    return tok_ok and lbl_ok and (keras_ok or saved_ok)
+
+def ensure_models_on_disk(model_root: Path) -> Tuple[bool, str]:
+    """
+    يتأكد أن المجلد موجود وجاهز. لو ناقص، يحاول تنزيله من Google Drive باستخدام gdown.
+    يرجّع (ok, msg).
+    """
+    try:
+        ar_ok = _lang_ready(model_root / "ar")
+        en_ok = _lang_ready(model_root / "en")
+        if ar_ok and en_ok:
+            return True, "Models already present."
+
+        # حاول تنزيل من Google Drive
+        import gdown
+        model_root.mkdir(parents=True, exist_ok=True)
+        with st.spinner("Downloading models from Google Drive..."):
+            # gdown يدعم تنزيل مجلد كامل من رابط drive/folders/...
+            gdown.download_folder(
+                url=GOOGLE_DRIVE_FOLDER_URL,
+                output=str(model_root),
+                quiet=False,
+                use_cookies=False
+            )
+
+        ar_ok = _lang_ready(model_root / "ar")
+        en_ok = _lang_ready(model_root / "en")
+        if ar_ok and en_ok:
+            return True, "Models downloaded from Google Drive."
+        else:
+            return False, "Downloaded, but expected structure not found (need ar/ and en/ inside)."
+    except ModuleNotFoundError:
+        return False, "gdown not installed. Add `gdown` to requirements.txt."
+    except Exception as e:
+        return False, f"Download failed: {e}"
 
 # ------------------------
 # Lang utils
@@ -93,26 +144,22 @@ AR_INTENSIFIERS = {"جداً","جدًا","مره","مرة","بشكل كبير","
 EMOJI_POS = {"😊","😍","🤩","😁","👍","💖","✨","👏","🥰"}
 EMOJI_NEG = {"😞","😡","🤬","😢","👎","💔","😠","😭"}
 
-EXCLAMATION_BOOST = 0.06   # تعزيز بسيط لو في ! كثيرة
-INTENSIFIER_BOOST = 0.07   # تعزيز لو في جداً/مره
-RULE_CONF = 0.55           # ثقة افتراضية لو قلبنا بالقاعدة
-LOW_CONF = 0.60            # لو أعلى احتمال أقل من هذا نسمح للقاعدة تقلب
-NEU_MARGIN = 0.18          # سماحية لفك الحياد
+EXCLAMATION_BOOST = 0.06
+INTENSIFIER_BOOST = 0.07
+RULE_CONF = 0.55
+LOW_CONF = 0.60
+NEU_MARGIN = 0.18
 
 def _rule_score_ar(text: str) -> str | None:
-    """قواعد سريعة: تُرجِع 'positive' أو 'negative' أو None."""
     t = ar_normalize(text)
     has_pos = any(w in t for w in AR_POS) or any(e in text for e in EMOJI_POS)
     has_neg = any(w in t for w in AR_NEG) or any(e in text for e in EMOJI_NEG)
-
-    # نفي بسيط: "مو حلو" = سلبي ، "مو سيء" = إيجابي تقريباً
     negation = any(n in t for n in AR_NEGATIONS)
     if negation:
         if has_pos and not has_neg:
             has_pos, has_neg = False, True
         elif has_neg and not has_pos:
             has_pos, has_neg = True, False
-
     if has_pos and not has_neg:
         return "positive"
     if has_neg and not has_pos:
@@ -126,31 +173,23 @@ def override_ar_prediction(
     classes: List[str],
     margin: float = NEU_MARGIN
 ) -> tuple[str, float]:
-    """يُرجع (label, confidence) بعد القواعد والتحسينات العربية."""
     try:
         i_neg = classes.index("negative")
         i_neu = classes.index("neutral")
         i_pos = classes.index("positive")
     except ValueError:
         return label, float(np.max(probs))
-
     p_neg, p_neu, p_pos = float(probs[i_neg]), float(probs[i_neu]), float(probs[i_pos])
-
-    # لو محايد وبالقرب من أحد الطرفين، نفك الحياد
     if label == "neutral":
         if p_neu - p_neg <= margin:
             label = "negative"
         if p_neu - p_pos <= margin:
             label = "positive"
-
-    # قواعد لغوية/إيموجي إذا الثقة ضعيفة أو ما زال محايد
     top_p = max(p_neg, p_neu, p_pos)
     rule = _rule_score_ar(text)
     if rule and (label == "neutral" or top_p < LOW_CONF):
         label = rule
         top_p = max(top_p, RULE_CONF)
-
-    # تعزيز حسب علامات التعجب والمكثِّفات
     boost = 0.0
     excl = text.count("!")
     if excl >= 2: boost += EXCLAMATION_BOOST
@@ -159,52 +198,7 @@ def override_ar_prediction(
         top_p = min(0.99, top_p + boost)
     if label == "negative" and boost > 0 and excl >= 3:
         top_p = min(0.99, top_p + boost/2)
-
     return label, top_p
-
-# ------------------------
-# Model loader that supports Keras *and* SavedModel
-# ------------------------
-def _load_any_model(model_path: Path):
-    """يحاول تحميل Keras model؛ وإن كان SavedModel بلا predict يلفّه بواجهة .predict()."""
-    ok, _ = ensure_tf()
-    import tensorflow as _tf
-
-    # 1) جرّبي Keras مباشرة
-    try:
-        m = _tf.keras.models.load_model(model_path)
-        if hasattr(m, "predict"):
-            return m
-    except Exception:
-        pass
-
-    # 2) Fallback: tf.saved_model.load + تغليف predict
-    loaded = _tf.saved_model.load(str(model_path))
-    fn = (loaded.signatures.get("serve") or
-          loaded.signatures.get("serving_default"))
-    if fn is None:
-        if hasattr(loaded, "signatures") and len(loaded.signatures) > 0:
-            fn = list(loaded.signatures.values())[0]
-        else:
-            raise RuntimeError(f"Could not find a serving signature in {model_path}")
-
-    out_keys = list(fn.structured_outputs.keys())
-
-    def _predict_nd(x: np.ndarray):
-        in_name = list(fn.structured_input_signature[1].keys())[0]
-        x_tf = _tf.convert_to_tensor(x)
-        if x_tf.dtype not in (_tf.int32, _tf.float32):
-            x_tf = _tf.cast(x_tf, _tf.int32)  # أغلب موديلاتنا تتوقع int32
-        res = fn(**{in_name: x_tf})
-        y = res[out_keys[0]].numpy()
-        return y
-
-    class _Wrapper:
-        def predict(self, x, verbose: int = 0):
-            x = np.asarray(x)
-            return _predict_nd(x)
-
-    return _Wrapper()
 
 # ------------------------
 # Loaders
@@ -237,7 +231,7 @@ def load_lang_assets(model_root: Path, lang: str):
     else:
         classes = CLASSES_FALLBACK
 
-    # model file (يدعم .keras أو saved_model/)
+    # model file
     candidates = [
         lang_dir / f"{lang}_best.keras",
         lang_dir / f"{lang}_final.keras",
@@ -249,7 +243,7 @@ def load_lang_assets(model_root: Path, lang: str):
     if model_path is None:
         raise FileNotFoundError(f"No model file found in {lang_dir}")
 
-    model = _load_any_model(model_path)
+    model = tf.keras.models.load_model(model_path)
     return tok, classes, model
 
 def _predict_batch(texts: List[str], model_root: Path) -> pd.DataFrame:
@@ -274,17 +268,15 @@ def _predict_batch(texts: List[str], model_root: Path) -> pd.DataFrame:
         subset = [preprocess_text(texts[i], lang) for i in idxs]
         seq = tok.texts_to_sequences(subset)
         X = pad_sequences(seq, maxlen=MAX_LEN, padding="post", truncating="post")
-        probs = model.predict(X, verbose=0)
+        probs = model(X, training=False).numpy()  # يعمل مع SavedModel وKeras
         pred_idx = np.argmax(probs, axis=1)
 
         for j, i_global in enumerate(idxs):
             base_label = classes[int(pred_idx[j])] if int(pred_idx[j]) < len(classes) else str(int(pred_idx[j]))
             conf = float(probs[j, pred_idx[j]])
             label = base_label
-
             if lang == "ar":
                 label, conf = override_ar_prediction(texts[i_global], base_label, probs[j], classes)
-
             row = {
                 "text": texts[i_global],
                 "lang": lang,
@@ -292,9 +284,7 @@ def _predict_batch(texts: List[str], model_root: Path) -> pd.DataFrame:
                 "confidence": float(conf),
             }
             for ci, cname in enumerate(classes):
-                # تجنّب خارج الفهرس إذا كان saved_model يعيد نفس الترتيب
-                if ci < probs.shape[1]:
-                    row[f"p_{cname}"] = float(probs[j, ci])
+                row[f"p_{cname}"] = float(probs[j, ci]) if ci < probs.shape[1] else np.nan
             rows.append(row)
     return pd.DataFrame(rows)
 
@@ -335,8 +325,21 @@ def read_csv(file) -> pd.DataFrame:
 # ------------------------
 with st.sidebar:
     st.header("⚙️ Settings | الإعدادات")
-    model_root = Path(st.text_input("Model directory | مسار الموديلات", value=str(DEFAULT_MODEL_DIR)))
-    st.caption("bilingual_sentiment_model/ar & /en each: model + tokenizer.json + label_map.json (+ saved_model/ أو .keras).")
+    model_root_str = st.text_input("Model directory | مسار الموديلات", value=str(DEFAULT_MODEL_DIR))
+    model_root = Path(model_root_str)
+    st.caption("سيتم تنزيل المجلد من Google Drive تلقائياً إذا لم يكن موجودًا.")
+    if st.button("⬇️ Download/Refresh from Google Drive"):
+        ok_dl, msg = ensure_models_on_disk(model_root)
+        if ok_dl: st.success(msg)
+        else: st.error(msg)
+
+# حاول التحميل تلقائيًا لو ناقص
+if not (_lang_ready(model_root / "ar") and _lang_ready(model_root / "en")):
+    ok_dl, msg = ensure_models_on_disk(model_root)
+    if ok_dl:
+        st.info(msg)
+    else:
+        st.warning(msg)
 
 # ------------------------
 # Title
@@ -413,15 +416,19 @@ with tabs[2]:
     st.write("**TensorFlow imported?**", ok_tf)
     if ok_tf:
         st.write("TF version:", tf.__version__)
-        st.write("Num GPUs:", len(tf.config.list_physical_devices('GPU')))
+        try:
+            st.write("Num GPUs:", len(tf.config.list_physical_devices('GPU')))
+        except Exception:
+            pass
     else:
         st.error(err_tf)
-    st.write("**Model root exists?**", DEFAULT_MODEL_DIR.exists(), str(DEFAULT_MODEL_DIR.resolve()))
+
+    st.write("**Model root:**", str(model_root.resolve()))
     for lang in ("ar","en"):
-        d = DEFAULT_MODEL_DIR / lang
-        st.write(f"**{lang} folder exists?**", d.exists(), str(d))
+        d = model_root / lang
+        st.write(f"**{lang} folder exists?**", d.exists())
         if d.exists():
             try:
-                st.code("\n".join([p.name for p in sorted(d.iterdir())]), language="bash")
+                st.code("\n".join([p.name for p in sorted(d.iterdir())][:50]), language="bash")
             except:
                 pass
